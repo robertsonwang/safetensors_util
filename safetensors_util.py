@@ -17,7 +17,7 @@ quiet_flag=click.option("-q","--quiet",default=False,is_flag=True, show_default=
                         help="Quiet mode, don't print informational stuff" )
 
 @click.group()
-@click.version_option(version=7)
+@click.version_option(version=8)
 @quiet_flag
 
 @click.pass_context
@@ -102,6 +102,13 @@ def cmd_compactfloat(ctx,input_file:str,output_file:str,force_overwrite:bool) ->
     import safetensors_cf
     ctx.obj['force_overwrite'] = force_overwrite
     sys.exit( safetensors_cf.CompactFloat(ctx.obj,input_file,output_file) )
+
+
+@cli.command(name="checkhdr",short_help="check header for possible errors")
+@readonly_input_file
+@click.pass_context
+def cmd_compactfloat(ctx,input_file:str) -> int:
+    sys.exit( safetensors_worker.CheckHeader(ctx.obj,input_file) )
 
 
 if __name__ == '__main__':
