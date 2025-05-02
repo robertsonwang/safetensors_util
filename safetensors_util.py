@@ -93,6 +93,17 @@ def cmd_checklora(ctx,input_file:str)->int:
     sys.exit( safetensors_worker.CheckLoRA(ctx.obj,input_file) )
 
 
+@cli.command(name="cf",short_help="compact F32 and F64 tensors to F16")
+@readonly_input_file
+@output_file
+@force_overwrite_flag
+@click.pass_context
+def cmd_compactfloat(ctx,input_file:str,output_file:str,force_overwrite:bool) -> int:
+    import safetensors_cf
+    ctx.obj['force_overwrite'] = force_overwrite
+    sys.exit( safetensors_cf.CompactFloat(ctx.obj,input_file,output_file) )
+
+
 if __name__ == '__main__':
     sys.stdout.reconfigure(encoding='utf-8')
     cli(obj={},max_content_width=96)
