@@ -65,7 +65,7 @@ def cmd_writemd(ctx,in_st_file:str,in_json_file:str,output_file:str,force_overwr
     sys.exit( safetensors_worker.WriteMetadataToHeader(ctx.obj,in_st_file,in_json_file,output_file) )
 
 
-@cli.command(name="extracthdr",short_help="extract file header and save to output file")
+@cli.command(name="extracthdr",short_help="extract file header and save to file")
 @readonly_input_file
 @output_file
 @force_overwrite_flag
