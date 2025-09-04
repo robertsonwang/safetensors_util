@@ -92,6 +92,11 @@ def cmd_extractheader(ctx,input_file:str,key_name:str,output_file:str,force_over
 def cmd_checklora(ctx,input_file:str)->int:
     sys.exit( safetensors_worker.CheckLoRA(ctx.obj,input_file) )
 
+@cli.command(name="detectlora",short_help="Inspect lora metadata and try to detect base architecture")
+@readonly_input_file
+@click.pass_context
+def cmd_detectlora(ctx,input_file:str)->int:
+    sys.exit( safetensors_worker.DetectLora(ctx.obj,input_file) )
 
 @cli.command(name="cf",short_help="compact F32 and F64 tensors to F16")
 @readonly_input_file

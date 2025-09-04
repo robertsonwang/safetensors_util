@@ -1,4 +1,4 @@
-import os, sys, json
+import os, re, sys, json
 from safetensors_file import SafeTensorsFile
 
 def _need_force_overwrite(output_file:str,cmdLine:dict) -> bool:
@@ -282,3 +282,192 @@ def CheckHeader(cmdLine:dict,input_file:str)->int:
 
     if rv==0: print("no error found")
     return rv
+
+def DetectLora(cmdLine: dict, input_file: str):
+    """
+    Try to determine what base architecture a LoRA is meant for using heuristics
+    over metadata, parameter names, and adapter shapes. The function returns as
+    soon as a confident match is found.
+
+    Heuristic order:
+      1. Metadata scan:
+         - Look for explicit mentions of SDXL, SD2, SD1.
+         - LLM family names: LLaMA, Mistral, Qwen2, Qwen.
+         - Flux markers (flux/flux.1/rectified flow/FluxTransformer2DModel/BFL)
+      2. Key pattern scan:
+         - LLM-style: model.layers.N, self_attn, (q|k|v|o)_proj, mlp.(down|gate|up)_proj.
+         - SD-style: unet, text_encoder, lora_te*.
+         - Flux-style: lora_transformer_*, transformer_blocks_*_attn_to_(q|k|v|out),
+           single_transformer_blocks_*, time_text_embed, context_embedder, x_embedder.
+      3. SD refinement:
+         - SDXL if a secondary text encoder (text_encoder_2 / te2) is found.
+         - Otherwise, infer by text encoder hidden size:
+             ~768 → SD1.x
+             ~1024 → SD2.x
+             ~1280 → SDXL
+         - If te1/te2 prefixes exist → SDXL.
+      4. Default to "unknown" if no signal matches.
+
+    Returns
+    -------
+    (label, reasons) : tuple
+        label   : string like "sdxl", "sd2.x", "sd1.x", "llama", "mistral",
+                  "qwen2", "qwen", "llama/mistral-like", "unknown"
+        reasons : dict with "signals" list explaining which hints were matched
+    """
+    s = SafeTensorsFile.open_file(input_file, cmdLine['quiet'])
+    if s.error != 0:
+        return "error", {"signals": [f"failed to open file: error {s.error}"]}
+
+    header = s.get_header()
+    if header is None:
+        return "error", {"signals": ["failed to get header"]}
+    metadata = header.get("__metadata__", {})
+
+    reasons = {"signals": []}
+    meta = metadata or {}
+
+    # 0) Explicit hints in metadata
+    meta_keys = " ".join(k.lower() for k in meta.keys())
+    meta_vals = " ".join(str(v).lower() for v in meta.values())
+    meta_blob = meta_keys + " " + meta_vals
+
+    def note(sig):
+        reasons["signals"].append(sig)
+
+    # Direct metadata hints (common fields used by trainers)
+    if any(x in meta_blob for x in ["sdxl", "stable diffusion xl", "text_encoder_2", "te2"]):
+        note("metadata mentions SDXL")
+        return "sdxl", reasons
+    if "sd2" in meta_blob or "sd 2" in meta_blob or "stable diffusion 2" in meta_blob:
+        note("metadata mentions SD2")
+        return "sd2.x", reasons
+    if "sd1" in meta_blob or "sd 1" in meta_blob or "stable diffusion 1" in meta_blob or "sd15" in meta_blob:
+        note("metadata mentions SD1")
+        return "sd1.x", reasons
+
+    if "llama" in meta_blob:
+        note("metadata mentions LLaMA family")
+        return "llama", reasons
+
+    if "mistral" in meta_blob:
+        note("metadata mentions Mistral family")
+        return "mistral", reasons
+
+    if "qwen2" in meta_blob or "qwen-2" in meta_blob:
+        note("metadata mentions Qwen2 family")
+        return "qwen2", reasons
+
+    if "qwen" in meta_blob:
+        note("metadata mentions Qwen (original) family")
+        return "qwen", reasons
+
+    # Flux families (Flux.1 / rectified flow / FluxTransformer2DModel / BFL)
+    if any(x in meta_blob for x in ["flux.1", "flux1", "flux 1", " flux ", "rectified flow", "fluxtransformer2dmodel", "black-forest-labs", "bfl"]):
+        variant = "flux"
+        if "schnell" in meta_blob:
+            variant = "flux.schnell"
+        elif "dev" in meta_blob:
+            variant = "flux.dev"
+        note("metadata mentions FLUX")
+        return variant, reasons
+
+    # -------- Collect keys --------
+    keys = [k for k in header.keys() if not k.startswith("__")]
+
+    def has_any(patterns):
+        for p in patterns:
+            rx = re.compile(p)
+            if any(rx.search(k) for k in keys):
+                return True
+        return False
+
+    def count_matches(patterns):
+        rxs = [re.compile(p) for p in patterns]
+        return sum(1 for k in keys for rx in rxs if rx.search(k))
+
+    def first_shape_of(regex):
+        r = re.compile(regex)
+        for k in keys:
+            if r.search(k):
+                sh = header[k].get("shape", [])
+                return tuple(sh)
+        return None
+
+    # -------- Flux key-pattern check (before SD/LLM split) --------
+    flux_patterns = [
+        r"(^|/|_)lora_transformer_",
+        r"\btransformer_blocks_\d+_attn_to_(q|k|v|out)",
+        r"\bsingle_transformer_blocks_\d+_attn_to_(q|k|v)",
+        r"\btime_text_embed",
+        r"\bcontext_embedder\b",
+        r"\bx_embedder\b",
+        r"\bnorm_out_linear\b",
+        r"\bproj_out\b",
+    ]
+    if count_matches(flux_patterns) >= 2:
+        # Try variant from obvious filename-style hints in keys (rare), else plain "flux"
+        variant = "flux"
+        if any("schnell" in k.lower() for k in keys):
+            variant = "flux.schnell"
+        elif any("dev" in k.lower() for k in keys):
+            variant = "flux.dev"
+        note("found Flux-style transformer adapter keys")
+        return variant, reasons
+
+    # — LLM LoRAs typically look like: "model.layers.0.self_attn.q_proj.lora_down.weight"
+    if has_any([r"^model\.layers\.\d+\.", r"\.self_attn\.", r"\.(q|k|v|o)_proj\.", r"\.mlp\.(down|gate|up)_proj\."]):
+        note("found LLM-style transformer layer patterns (q_proj/k_proj/etc.)")
+        return "llama/mistral-like", reasons
+
+    # SD-family patterns (Kohya/lycoris naming variants)
+    # Common UNet/text encoder LoRA key prefixes in SD ecosystem
+    is_sd = has_any([
+        r"(^|/|_)lora_unet_", r"(^|/|_)lora_te\d?_",
+        r"^unet\.", r"^text_encoder(\.|\d|_)", r"text_model\.encoder\.layers",
+        r"^transformer\.", r"attentions?\.", r"to_(q|k|v|out)\.lora_(down|up)\.weight",
+    ])
+    if not is_sd:
+        return "unknown", reasons
+
+    # -------- SD refinement --------
+    # SDXL almost always includes Text Encoder 1 *and* Text Encoder 2 or explicit "text_encoder_2" blocks
+    if has_any([r"text_encoder_2", r"\blora_te2_", r"\bte2\b"]):
+        note("found text_encoder_2 / te2 blocks (SDXL hallmark)")
+        return "sdxl", reasons
+
+    # If only one text encoder: use hidden size shapes to decide
+    # Typical hidden sizes (by common trainers and checkpoints):
+    #   SD1.x: CLIP ViT-L/14 (hidden_size ~ 768)
+    #   SD2.x: OpenCLIP ViT-H/14 (hidden_size ~ 1024)
+    #   SDXL:  Text Encoder 1 ~ 768, Text Encoder 2 ~ 1280 (already caught above)
+    #
+    # Find a text encoder projection weight to sniff dims (examples):
+    #   "...text_model.encoder.layers.X.self_attn.out_proj.lora_down.weight"
+    #   Kohya often prefixes with lora_te_...; shapes are [out, in]
+    te_shape = (
+        first_shape_of(r"text_encoder(\.|_).*lora_(down|A)\.weight")
+        or first_shape_of(r"(^|_)lora_te\d?_.+lora_(down|A)\.weight")
+    )
+
+    if te_shape:
+        out_dim, in_dim = te_shape[:2] if len(te_shape) >= 2 else (None, None)
+        note(f"text encoder proj shape hint: {te_shape}")
+        # Heuristic thresholds
+        if 740 <= (out_dim or 0) <= 800 or 740 <= (in_dim or 0) <= 800:
+            note("text encoder hidden size ~768 → SD1.x")
+            return "sd1.x", reasons
+        if 1000 <= (out_dim or 0) <= 1050 or 1000 <= (in_dim or 0) <= 1050:
+            note("text encoder hidden size ~1024 → SD2.x")
+            return "sd2.x", reasons
+        if 1250 <= (out_dim or 0) <= 1310 or 1250 <= (in_dim or 0) <= 1310:
+            note("text encoder hidden size ~1280 (often TE2) → SDXL")
+            return "sdxl", reasons
+
+    # If text encoder shapes were inconclusive, look for dual-text encoder naming used by some trainers:
+    if has_any([r"\blora_te1_", r"\blora_te2_"]):
+        note("saw te1/te2 prefixes → SDXL")
+        return "sdxl", reasons
+
+    # Default SD bucket
+    return "unknown", reasons
